@@ -9,15 +9,15 @@ import json
 import pickle
 import urllib
 from functools import partial
-from neuclease.util.segmentation import binary_edge_mask
-from neuclease.util.util import compute_parallel
+
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from skimage.measure import label
 
-from neuclease.util import round_box, upsample, mask_for_labels, compute_nonzero_box, extract_subvol, contingency_table, binary_edge_mask, iter_batches
-from neuclease.dvid import fetch_info, fetch_labelmap_voxels, fetch_sizes
+from neuprint import Client, fetch_neurons
+from neuclease.util import round_box, mask_for_labels, compute_nonzero_box, extract_subvol, contingency_table, binary_edge_mask, iter_batches, compute_parallel
+from neuclease.dvid import fetch_info, fetch_labelmap_voxels, fetch_sizes, fetch_labels_batched, determine_point_rois
 
 EXAMPLE_NEUROGLANCER_LINK = """\
 http://hemibrain-dvid2.janelia.org:8000/neuroglancer/#!%7B%22dimensions%22:%7B%22x%22:%5B8e-9%2C%22m%22%5D%2C%22y%22:%5B8e-9%2C%22m%22%5D%2C%22z%22:%5B8e-9%2C%22m%22%5D%7D%2C%22position%22:%5B9999.525390625%2C19841.533203125%2C13040%5D%2C%22crossSectionScale%22:0.406569659740599%2C%22projectionOrientation%22:%5B-0.30359750986099243%2C0.21658426523208618%2C-0.08182431757450104%2C0.9242427349090576%5D%2C%22projectionScale%22:804.6077478874928%2C%22layers%22:%5B%7B%22type%22:%22image%22%2C%22source%22:%22precomputed://gs://neuroglancer-janelia-flyem-hemibrain/emdata/clahe_yz/jpeg%22%2C%22tab%22:%22source%22%2C%22name%22:%22jpeg%22%7D%2C%7B%22type%22:%22segmentation%22%2C%22source%22:%22precomputed://gs://neuroglancer-janelia-flyem-hemibrain/v1.1/segmentation%22%2C%22tab%22:%22source%22%2C%22name%22:%22segmentation%22%2C%22visible%22:false%7D%2C%7B%22type%22:%22segmentation%22%2C%22source%22:%22dvid://http://hemibrain-dvid2.janelia.org:8000/a7e1303c0c294ed99b66be7ab679cbb5/neighborhood-masks%22%2C%22tab%22:%22source%22%2C%22segments%22:%5B%2256007023659456%22%5D%2C%22name%22:%22neighborhood-masks%22%7D%2C%7B%22type%22:%22segmentation%22%2C%22source%22:%22dvid://http://emdata3:8900/62f6394a18d4490c93892fbd9f1416b5/masked-mito-cc%22%2C%22tab%22:%22source%22%2C%22name%22:%22masked-mito-cc%22%7D%5D%2C%22showSlices%22:false%2C%22selectedLayer%22:%7B%22layer%22:%22masked-mito-cc%22%2C%22visible%22:true%7D%2C%22layout%22:%224panel%22%7D
@@ -55,12 +55,7 @@ NEUROGLANCER_SETTINGS = {
             "type": "segmentation",
             "source": "dvid://http://emdata3:8900/62f6394a18d4490c93892fbd9f1416b5/masked-mito-cc",
             "tab": "segments",
-            "name": "mito-svs",
-            "segments": [
-                "7142421023",
-                "7142421482",
-                "7142421671"
-            ]
+            "name": "mito-svs"
         }
     ],
     "showSlices": False,
@@ -71,6 +66,12 @@ NEUROGLANCER_SETTINGS = {
 RADIUS = 250
 MITO_SVS = ('http://emdata3.int.janelia.org:8900', '62f6394a18d4490c93892fbd9f1416b5', 'masked-mito-cc') # for visualization
 MITO_SEG = ('http://emdata3.int.janelia.org:8900', 'd31b64ac81444923a0319961736a6c31', 'masked-mito-cc')
+
+# Ideally, we would have listed this in the assignments, indicating
+# which segmentation was used to generate the neighborhoods.
+NEURON_SEG = ('http://emdata4.int.janelia.org:8900', '20631f94c3f446d7864bc55bf515706e', 'segmentation')
+
+NEUPRINT_CLIENT = Client('neuprint.janelia.org', 'hemibrain:v1.1')
 
 # Mito size threshold (in terms of 8nm voxels)
 # Mito segments smaller than this weren't assigned
@@ -85,9 +86,6 @@ NEIGHBORHOOD_RES = 8
 # It doesn't make sense to do this analysis at scale 0,
 # since the mitos were generated at scale-1 anyway.
 ANALYSIS_SCALE = 1
-
-# For debugging
-EARLY_STOP = -1
 
 # Note about analysis scale and neighborhood erosion step
 # -------------------------------------------------------
@@ -126,9 +124,10 @@ def main():
     new_names['result'] = 'proofreader_count'
     mc_df = mc_df.rename(columns=new_names)
 
+    print("Evaluating mito count results")
     results = compute_parallel(
         partial(_task_results, mito_res_scale_diff),
-        iter_batches(mc_df.iloc[:EARLY_STOP].drop_duplicates('neighborhood_id'), 1),
+        iter_batches(mc_df.drop_duplicates('neighborhood_id'), 1),
         total=len(mc_df),
         processes=PROCESSES,
         leave_progress=True,
@@ -147,6 +146,21 @@ def main():
             'ng_link']
 
     df = pd.DataFrame(results, columns=cols)
+
+    # Add columns for cell type (from neuprint)
+    print("Fetching neuron cell types")
+    origins_df = pd.DataFrame(df['neighborhood_origin'].tolist(), columns=[*'xyz'])
+    df['body'] = fetch_labels_batched(*NEURON_SEG, origins_df[[*'zyx']].values, processes=8)
+    neurons_df, _ = fetch_neurons(df['body'].unique())
+    neurons_df = neurons_df.rename(columns={'bodyId': 'body', 'type': 'body_type', 'instance': 'body_instance'})
+    df = df.merge(neurons_df[['body', 'body_type', 'body_instance']], 'left', on='body')
+    df['body_type'].fillna("", inplace=True)
+    df['body_instance'].fillna("", inplace=True)
+
+    # Append roi column
+    print("Determining ROIs")
+    determine_point_rois(*NEURON_SEG[:2], NEUPRINT_CLIENT.primary_rois, origins_df)
+    df['roi'] = origins_df['roi']
 
     # Results only
     path = 'mito-seg-counts.pkl'
@@ -212,6 +226,7 @@ def _task_results(mito_res_scale_diff, task_df):
           ng_link )
 
     return r
+
 
 def mitos_in_neighborhood(mito_roi_source, neighborhood_origin_xyz, neighborhood_id, mito_res_scale_diff):
     """
