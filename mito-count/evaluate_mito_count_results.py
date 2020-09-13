@@ -8,13 +8,15 @@ import copy
 import json
 import pickle
 import urllib
+from functools import partial
 from neuclease.util.segmentation import binary_edge_mask
+from neuclease.util.util import compute_parallel
 import numpy as np
 import pandas as pd
 from tqdm import tqdm
 from skimage.measure import label
 
-from neuclease.util import round_box, upsample, mask_for_labels, compute_nonzero_box, extract_subvol, contingency_table, binary_edge_mask
+from neuclease.util import round_box, upsample, mask_for_labels, compute_nonzero_box, extract_subvol, contingency_table, binary_edge_mask, iter_batches
 from neuclease.dvid import fetch_info, fetch_labelmap_voxels, fetch_sizes
 
 EXAMPLE_NEUROGLANCER_LINK = """\
@@ -104,6 +106,10 @@ EARLY_STOP = -1
 
 def main():
     RESULTS_PKL_PATH = sys.argv[1]
+    if len(sys.argv) == 3:
+        PROCESSES = sys.arvc[2]
+    else:
+        PROCESSES = 4
 
     # Calculate the difference in resolution between the stored mito segmentation and neuron segmenation.
     # If they differ, it must be by a power of 2.
@@ -120,41 +126,14 @@ def main():
     new_names['result'] = 'proofreader_count'
     mc_df = mc_df.rename(columns=new_names)
 
-    results = []
-    for row in tqdm(mc_df.iloc[:EARLY_STOP].drop_duplicates('neighborhood_id').itertuples(), total=len(mc_df)):
-        mito_table = mitos_in_neighborhood( row.mito_ROI_source,
-                                            row.neighborhood_origin,
-                                            row.neighborhood_id,
-                                            mito_res_scale_diff )
-
-        mito_ids = mito_table.index.drop_duplicates().values
-        mito_sizes = mito_table.reset_index().drop_duplicates('mito')['size']
-        mito_ccs = mito_table.groupby(mito_table.index, sort=False).agg({'cc': tuple, 'cc_size': tuple})
-
-        ng_settings = copy.deepcopy(NEUROGLANCER_SETTINGS)
-        ng_settings['position'] = list(row.neighborhood_origin)
-
-        def select_layer(name):
-            return [l for l in ng_settings["layers"] if l['name'] == name][0]
-
-        select_layer("neighborhood-masks")["source"] = row.mito_ROI_source
-        select_layer("mito-svs")["source"] = "dvid://{}/{}/{}".format(*MITO_SVS)
-        select_layer("mito-svs")["segments"] = [str(mito) for mito in mito_ids]
-
-        ng_link = NEUROGLANCER_ENDPOINT + '/#!' + urllib.parse.quote(json.dumps(ng_settings))
-
-        r = ( row.neighborhood_id,
-              row.neighborhood_origin,
-              row.proofreader_count,
-              mito_table.index.nunique(),
-              tuple(mito_ids),
-              tuple(mito_sizes),
-              mito_table['cc'].nunique(),
-              tuple(mito_ccs['cc']),
-              tuple(mito_ccs['cc_size']),
-              ng_link )
-
-        results.append(r)
+    results = compute_parallel(
+        partial(_task_results, mito_res_scale_diff),
+        iter_batches(mc_df.iloc[:EARLY_STOP].drop_duplicates('neighborhood_id'), 1),
+        total=len(mc_df),
+        processes=PROCESSES,
+        leave_progress=True,
+        ordered=False
+    )
 
     cols = ['neighborhood_id',
             'neighborhood_origin',
@@ -194,7 +173,61 @@ def main():
     print("DONE")
 
 
+def _task_results(mito_res_scale_diff, task_df):
+    """
+    Process the given input row and return a tuple to be used as a row of output results.
+    """
+    assert len(task_df) == 1
+    row = next(task_df.itertuples())
+    mito_table = mitos_in_neighborhood( row.mito_ROI_source,
+                                        row.neighborhood_origin,
+                                        row.neighborhood_id,
+                                        mito_res_scale_diff )
+
+    mito_ids = mito_table.index.drop_duplicates().values
+    mito_sizes = mito_table.reset_index().drop_duplicates('mito')['size']
+    mito_ccs = mito_table.groupby(mito_table.index, sort=False).agg({'cc': tuple, 'cc_size': tuple})
+
+    ng_settings = copy.deepcopy(NEUROGLANCER_SETTINGS)
+    ng_settings['position'] = list(row.neighborhood_origin)
+
+    def select_layer(name):
+        return [l for l in ng_settings["layers"] if l['name'] == name][0]
+
+    select_layer("neighborhood-masks")["source"] = row.mito_ROI_source
+    select_layer("mito-svs")["source"] = "dvid://{}/{}/{}".format(*MITO_SVS)
+    select_layer("mito-svs")["segments"] = [str(mito) for mito in mito_ids]
+
+    ng_link = NEUROGLANCER_ENDPOINT + '/#!' + urllib.parse.quote(json.dumps(ng_settings))
+
+    r = ( row.neighborhood_id,
+          row.neighborhood_origin,
+          row.proofreader_count,
+          mito_table.index.nunique(),
+          tuple(mito_ids),
+          tuple(mito_sizes),
+          mito_table['cc'].nunique(),
+          tuple(mito_ccs['cc']),
+          tuple(mito_ccs['cc_size']),
+          ng_link )
+
+    return r
+
 def mitos_in_neighborhood(mito_roi_source, neighborhood_origin_xyz, neighborhood_id, mito_res_scale_diff):
+    """
+    Determine how many non-trivial mito objects overlap with the given "neighborhood object",
+    and return a table of their IDs and sizes.
+
+    1. Download the neighborhood mask for the given neighborhood_id.
+    2. Erode the neighborhood mask by 1 px (see note in the comment above).
+    3. Fetch the mito segmentation for the voxels within the neighborhood.
+    4. Fetch (from dvid) the sizes of each mito object.
+    5. Filter out the mitos that are smaller than the minimum size that is
+       actually used in our published mito analyses.
+    6. Just for additional info, determine how many connected components
+       are formed by the mito objects.
+    7. Return the mito IDs, sizses, and CC info as a DataFrame.
+    """
     # The neighborhood segmentation source
     protocol, url = mito_roi_source.split('://')[-2:]
     server, uuid, instance = url.split('/')
@@ -248,5 +281,4 @@ if __name__ == "__main__":
     #import os
     #os.chdir('/Users/bergs/Documents/FlyEM/mito-project/proofreading/mito-count')
     #sys.argv.append('mito-count-results.pkl')
-
     main()
